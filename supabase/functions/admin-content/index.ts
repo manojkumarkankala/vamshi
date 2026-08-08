@@ -88,6 +88,28 @@ Deno.serve(async (req: Request) => {
       return json({ url: pub.publicUrl, path });
     }
 
+    // ===== Upload document (resume, PDF, Word, etc.) =====
+    if (action === "upload-file") {
+      const { base64, fileName, contentType, field } = body as {
+        base64: string;
+        fileName: string;
+        contentType: string;
+        field: string;
+      };
+      if (!base64 || !fileName) {
+        return json({ error: "Missing base64 or fileName" }, 400);
+      }
+      const clean = base64.replace(/^data:[^;]+;base64,/, "");
+      const bin = Uint8Array.from(atob(clean), (c) => c.charCodeAt(0));
+      const path = `${field}/${Date.now()}-${fileName}`;
+      const { error: upErr } = await supabase.storage
+        .from("portfolio-images")
+        .upload(path, bin, { contentType, upsert: true });
+      if (upErr) return json({ error: upErr.message }, 500);
+      const { data: pub } = supabase.storage.from("portfolio-images").getPublicUrl(path);
+      return json({ url: pub.publicUrl, path });
+    }
+
     // ===== site_content (single row) =====
     if (action === "update-site-content") {
       const updates = body as Record<string, unknown>;
