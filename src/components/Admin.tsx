@@ -12,6 +12,9 @@ import {
   Image as ImageIcon,
   GripVertical,
   Star,
+  FileText,
+  Download,
+  ExternalLink,
 } from 'lucide-react';
 import { FUNCTION_URL } from '@/supabaseClient';
 import {
@@ -234,6 +237,23 @@ async function uploadImage(file: File, field: string): Promise<string> {
   return data.url as string;
 }
 
+async function uploadFile(file: File, field: string): Promise<string> {
+  const reader = new FileReader();
+  const base64: string = await new Promise((resolve, reject) => {
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+  const data = await adminFetch({
+    action: 'upload-file',
+    base64,
+    fileName: file.name,
+    contentType: file.type || 'application/octet-stream',
+    field,
+  });
+  return data.url as string;
+}
+
 function SaveButton({ saving, onSave, label = 'Save Changes' }: { saving: boolean; onSave: () => void; label?: string }) {
   return (
     <button
@@ -302,6 +322,71 @@ function ImageUpload({ field, currentUrl, onUploaded }: { field: string; current
   );
 }
 
+// ===== File Upload (resume, PDF, Word, etc.) =====
+function FileUpload({ field, currentUrl, onUploaded }: { field: string; currentUrl?: string; onUploaded: (url: string) => void }) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handle = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setError('');
+    try {
+      const url = await uploadFile(file, field);
+      onUploaded(url);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const fileName = currentUrl ? currentUrl.split('/').pop() ?? currentUrl : '';
+
+  return (
+    <div>
+      <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-navy-500">
+        Resume File
+      </label>
+      <div className="flex items-center gap-4">
+        <div className="flex h-20 w-20 shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-navy-200 bg-navy-50">
+          {currentUrl ? (
+            <FileText className="h-9 w-9 text-accent-500" />
+          ) : (
+            <FileText className="h-8 w-8 text-navy-300" />
+          )}
+        </div>
+        <div className="flex flex-col gap-2">
+          <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-navy-200 bg-white px-4 py-2.5 text-sm font-semibold text-navy-700 transition-colors hover:bg-navy-50">
+            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+            {uploading ? 'Uploading…' : 'Upload Resume'}
+            <input type="file" accept=".pdf,.doc,.docx,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={handle} className="hidden" />
+          </label>
+          {currentUrl && (
+            <div className="flex items-center gap-2">
+              <a
+                href={currentUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-medium text-accent-600 hover:underline"
+              >
+                <ExternalLink className="h-3 w-3" />
+                View / Download
+              </a>
+            </div>
+          )}
+        </div>
+      </div>
+      {error && <p className="mt-1.5 text-sm text-red-600">{error}</p>}
+      {currentUrl && (
+        <p className="mt-1.5 truncate text-xs text-navy-400">{fileName}</p>
+      )}
+      <p className="mt-1.5 text-xs text-navy-400">Upload PDF, Word, or text file. Visitors can download it from the site.</p>
+    </div>
+  );
+}
+
 // ===== Profile Editor =====
 function ProfileEditor({ content, onSaved }: { content: AllContent; onSaved: () => void }) {
   const p = content.siteContent.profile;
@@ -364,10 +449,7 @@ function ProfileEditor({ content, onSaved }: { content: AllContent; onSaved: () 
 
       <div className="mt-6 grid gap-5 sm:grid-cols-2">
         <ImageUpload field="hero" currentUrl={heroImage} onUploaded={setHeroImage} />
-        <div>
-          <Input label="Resume File Path / URL" value={resumePath} onChange={setResumePath} />
-          <p className="mt-1.5 text-xs text-navy-400">Path to your resume file (e.g. /Kankala-Vamshi-Resume.pdf)</p>
-        </div>
+        <FileUpload field="resume" currentUrl={resumePath} onUploaded={setResumePath} />
       </div>
 
       <div className="mt-6 flex items-center gap-3">
