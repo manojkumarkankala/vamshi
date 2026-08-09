@@ -49,6 +49,7 @@ export default function Admin() {
   const [content, setContent] = useState<AllContent | null>(null);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<Tab>('profile');
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
     if (authed) loadContent();
@@ -56,11 +57,13 @@ export default function Admin() {
 
   async function loadContent() {
     setLoading(true);
+    setLoadError('');
     try {
       const c = await fetchAllContent();
       setContent(c);
-    } catch {
+    } catch (err) {
       setContent(null);
+      setLoadError(getErrorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -107,9 +110,20 @@ export default function Admin() {
       </header>
 
       <div className="mx-auto max-w-6xl px-5 py-8">
-        {loading || !content ? (
+        {loading ? (
           <div className="flex items-center justify-center py-32 text-navy-400">
             <Loader2 className="h-8 w-8 animate-spin" />
+          </div>
+        ) : !content ? (
+          <div className="mx-auto max-w-xl rounded-2xl border border-red-200 bg-red-50 p-6">
+            <h2 className="text-lg font-bold text-red-800">Unable to load admin data</h2>
+            <p className="mt-2 text-sm leading-relaxed text-red-700">{loadError || 'The server could not be reached.'}</p>
+            <button
+              onClick={loadContent}
+              className="mt-4 inline-flex items-center gap-2 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-700"
+            >
+              Try Again
+            </button>
           </div>
         ) : (
           <div className="grid gap-6 lg:grid-cols-[200px_1fr]">
@@ -206,57 +220,116 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
 }
 
 // ===== Shared helpers =====
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === 'string' && error.trim()) return error;
+  return 'Something went wrong. Please try again.';
+}
+
 async function adminFetch(body: Record<string, unknown>) {
-  const res = await fetch(FUNCTION_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Admin-Password': PASSWORD,
-    },
-    body: JSON.stringify(body),
+  if (!FUNCTION_URL) {
+    throw new Error('Supabase function URL is missing. Check your VITE_SUPABASE_URL / FUNCTION_URL configuration.');
+  }
+
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 30000);
+
+  try {
+    let res: Response;
+
+    try {
+      res = await fetch(FUNCTION_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Password': PASSWORD,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw new Error('Request timed out. Check your internet connection and Supabase Edge Function, then try again.');
+      }
+      throw new Error(
+        'Failed to connect to the server. Check FUNCTION_URL, Supabase Edge Function deployment, and CORS settings.'
+      );
+    }
+
+    const raw = await res.text();
+    let data: Record<string, unknown> = {};
+
+    if (raw) {
+      try {
+        data = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        if (!res.ok) {
+          throw new Error(`Server returned ${res.status}: ${raw.slice(0, 200)}`);
+        }
+        throw new Error('Server returned an invalid response. Check the Supabase Edge Function logs.');
+      }
+    }
+
+    if (!res.ok) {
+      const message = typeof data.error === 'string' ? data.error : `Request failed (${res.status})`;
+      throw new Error(message);
+    }
+
+    return data;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  if (!file) throw new Error('Please select a file.');
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== 'string') {
+        reject(new Error('Could not read the selected file.'));
+        return;
+      }
+      resolve(result);
+    };
+    reader.onerror = () => reject(new Error('Could not read the selected file. Please try again.'));
+    reader.onabort = () => reject(new Error('File reading was cancelled.'));
+    reader.readAsDataURL(file);
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-  return data;
 }
 
 async function uploadImage(file: File, field: string): Promise<string> {
-  const reader = new FileReader();
-  const base64: string = await new Promise((resolve, reject) => {
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
+  if (!file.type.startsWith('image/')) {
+    throw new Error('Please select a valid image file.');
+  }
+
+  const maxSize = 5 * 1024 * 1024;
+  if (file.size > maxSize) {
+    throw new Error('Image is too large. Please use an image smaller than 5 MB.');
+  }
+
+  const base64 = await fileToBase64(file);
   const data = await adminFetch({
     action: 'upload-image',
     base64,
     fileName: file.name,
-    contentType: file.type || 'image/png',
+    contentType: file.type,
     field,
   });
-  return data.url as string;
-}
 
-async function uploadFile(file: File, field: string): Promise<string> {
-  const reader = new FileReader();
-  const base64: string = await new Promise((resolve, reject) => {
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-  const data = await adminFetch({
-    action: 'upload-file',
-    base64,
-    fileName: file.name,
-    contentType: file.type || 'application/octet-stream',
-    field,
-  });
-  return data.url as string;
+  if (typeof data.url !== 'string' || !data.url) {
+    throw new Error('Upload succeeded but the server did not return an image URL.');
+  }
+
+  return data.url;
 }
 
 function SaveButton({ saving, onSave, label = 'Save Changes' }: { saving: boolean; onSave: () => void; label?: string }) {
   return (
     <button
+      type="button"
       onClick={onSave}
       disabled={saving}
       className="inline-flex items-center gap-2 rounded-xl bg-accent-500 px-5 py-2.5 text-sm font-semibold text-white transition-all hover:bg-accent-600 active:scale-95 disabled:opacity-50"
@@ -276,20 +349,33 @@ function SavedToast({ show }: { show: boolean }) {
   );
 }
 
+function ErrorBanner({ message }: { message: string }) {
+  if (!message) return null;
+  return (
+    <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">
+      <p className="font-semibold">Something went wrong</p>
+      <p className="mt-1 break-words">{message}</p>
+    </div>
+  );
+}
+
 function ImageUpload({ field, currentUrl, onUploaded }: { field: string; currentUrl?: string; onUploaded: (url: string) => void }) {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState('');
 
   const handle = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+
     setUploading(true);
     setError('');
+
     try {
       const url = await uploadImage(file, field);
       onUploaded(url);
     } catch (err) {
-      setError((err as Error).message);
+      setError(getErrorMessage(err));
     } finally {
       setUploading(false);
     }
@@ -308,81 +394,46 @@ function ImageUpload({ field, currentUrl, onUploaded }: { field: string; current
             <ImageIcon className="h-8 w-8 text-navy-300" />
           )}
         </div>
-        <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-navy-200 bg-white px-4 py-2.5 text-sm font-semibold text-navy-700 transition-colors hover:bg-navy-50">
+        <label className={`inline-flex items-center gap-2 rounded-xl border border-navy-200 bg-white px-4 py-2.5 text-sm font-semibold text-navy-700 transition-colors ${uploading ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-navy-50'}`}>
           {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
           {uploading ? 'Uploading…' : 'Upload Image'}
-          <input type="file" accept="image/*" onChange={handle} className="hidden" />
+          <input type="file" accept="image/*" onChange={handle} disabled={uploading} className="hidden" />
         </label>
       </div>
-      {error && <p className="mt-1.5 text-sm text-red-600">{error}</p>}
-      {currentUrl && (
-        <p className="mt-1.5 truncate text-xs text-navy-400">{currentUrl}</p>
-      )}
+      <ErrorBanner message={error} />
+      {currentUrl && <p className="mt-1.5 truncate text-xs text-navy-400">{currentUrl}</p>}
     </div>
   );
 }
 
-// ===== File Upload (resume, PDF, Word, etc.) =====
-function FileUpload({ field, currentUrl, onUploaded }: { field: string; currentUrl?: string; onUploaded: (url: string) => void }) {
-  const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState('');
-
-  const handle = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUploading(true);
-    setError('');
-    try {
-      const url = await uploadFile(file, field);
-      onUploaded(url);
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const fileName = currentUrl ? currentUrl.split('/').pop() ?? currentUrl : '';
-
+// Resume is intentionally served from /public instead of being uploaded as base64.
+function ResumeFileCard() {
   return (
     <div>
       <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-navy-500">
         Resume File
       </label>
-      <div className="flex items-center gap-4">
-        <div className="flex h-20 w-20 shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-navy-200 bg-navy-50">
-          {currentUrl ? (
-            <FileText className="h-9 w-9 text-accent-500" />
-          ) : (
-            <FileText className="h-8 w-8 text-navy-300" />
-          )}
+      <div className="flex items-center gap-4 rounded-xl border border-navy-200 bg-navy-50/30 p-4">
+        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white">
+          <FileText className="h-7 w-7 text-accent-500" />
         </div>
-        <div className="flex flex-col gap-2">
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-navy-200 bg-white px-4 py-2.5 text-sm font-semibold text-navy-700 transition-colors hover:bg-navy-50">
-            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-            {uploading ? 'Uploading…' : 'Upload Resume'}
-            <input type="file" accept=".pdf,.doc,.docx,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={handle} className="hidden" />
-          </label>
-          {currentUrl && (
-            <div className="flex items-center gap-2">
-              <a
-                href={currentUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-xs font-medium text-accent-600 hover:underline"
-              >
-                <ExternalLink className="h-3 w-3" />
-                View / Download
-              </a>
-            </div>
-          )}
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold text-navy-900">Kankala-Vamshi-Resume.pdf</p>
+          <p className="truncate text-xs text-navy-500">/Kankala-Vamshi-Resume.pdf</p>
         </div>
+        <a
+          href="/Kankala-Vamshi-Resume.pdf"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-navy-200 bg-white px-3 py-2 text-xs font-semibold text-navy-700 hover:bg-navy-50"
+        >
+          <ExternalLink className="h-3.5 w-3.5" />
+          View
+        </a>
       </div>
-      {error && <p className="mt-1.5 text-sm text-red-600">{error}</p>}
-      {currentUrl && (
-        <p className="mt-1.5 truncate text-xs text-navy-400">{fileName}</p>
-      )}
-      <p className="mt-1.5 text-xs text-navy-400">Upload PDF, Word, or text file. Visitors can download it from the site.</p>
+      <p className="mt-1.5 text-xs text-navy-400">
+        Resume is stored in the public folder. Visitors download it from /Kankala-Vamshi-Resume.pdf.
+      </p>
     </div>
   );
 }
@@ -402,12 +453,14 @@ function ProfileEditor({ content, onSaved }: { content: AllContent; onSaved: () 
     instagram: p.socials.instagram,
   });
   const [heroImage, setHeroImage] = useState(content.siteContent.hero_image_url);
-  const [resumePath, setResumePath] = useState(content.siteContent.resume_path);
+  const resumePath = '/Kankala-Vamshi-Resume.pdf';
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   const save = async () => {
     setSaving(true);
+    setSaveError('');
     try {
       await adminFetch({
         action: 'update-site-content',
@@ -421,13 +474,13 @@ function ProfileEditor({ content, onSaved }: { content: AllContent; onSaved: () 
           socials: { linkedin: form.linkedin, github: form.github, instagram: form.instagram },
         },
         hero_image_url: heroImage,
-        resume_path: resumePath,
+        resume_path: '/Kankala-Vamshi-Resume.pdf',
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
       onSaved();
     } catch (err) {
-      alert((err as Error).message);
+      setSaveError(getErrorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -449,13 +502,14 @@ function ProfileEditor({ content, onSaved }: { content: AllContent; onSaved: () 
 
       <div className="mt-6 grid gap-5 sm:grid-cols-2">
         <ImageUpload field="hero" currentUrl={heroImage} onUploaded={setHeroImage} />
-        <FileUpload field="resume" currentUrl={resumePath} onUploaded={setResumePath} />
+        <ResumeFileCard />
       </div>
 
       <div className="mt-6 flex items-center gap-3">
         <SaveButton saving={saving} onSave={save} />
         <SavedToast show={saved} />
       </div>
+      <ErrorBanner message={saveError} />
     </Card>
   );
 }
@@ -474,9 +528,11 @@ function AboutEditor({ content, onSaved }: { content: AllContent; onSaved: () =>
   const [aboutImage, setAboutImage] = useState(content.siteContent.about_image_url);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   const save = async () => {
     setSaving(true);
+    setSaveError('');
     try {
       await adminFetch({
         action: 'update-site-content',
@@ -493,7 +549,7 @@ function AboutEditor({ content, onSaved }: { content: AllContent; onSaved: () =>
       setTimeout(() => setSaved(false), 2500);
       onSaved();
     } catch (err) {
-      alert((err as Error).message);
+      setSaveError(getErrorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -513,6 +569,7 @@ function AboutEditor({ content, onSaved }: { content: AllContent; onSaved: () =>
         <SaveButton saving={saving} onSave={save} />
         <SavedToast show={saved} />
       </div>
+      <ErrorBanner message={saveError} />
     </Card>
   );
 }
@@ -586,6 +643,7 @@ function CollectionEditor<T extends { id?: string; sort_order?: number }>({
   const [items, setItems] = useState<T[]>(rows);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   // Local image state for portfolio items
   const [screenshotUrls, setScreenshotUrls] = useState<Record<string, string>>(
@@ -613,7 +671,7 @@ function CollectionEditor<T extends { id?: string; sort_order?: number }>({
       try {
         await adminFetch({ action: 'delete', table: collection, id: item.id });
       } catch (err) {
-        alert((err as Error).message);
+        setSaveError(getErrorMessage(err));
         return;
       }
     }
@@ -623,6 +681,7 @@ function CollectionEditor<T extends { id?: string; sort_order?: number }>({
 
   const save = async () => {
     setSaving(true);
+    setSaveError('');
     try {
       const payload = items.map((it, idx) => ({
         ...it,
@@ -635,7 +694,7 @@ function CollectionEditor<T extends { id?: string; sort_order?: number }>({
       setTimeout(() => setSaved(false), 2500);
       onSaved();
     } catch (err) {
-      alert((err as Error).message);
+      setSaveError(getErrorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -733,6 +792,7 @@ function CollectionEditor<T extends { id?: string; sort_order?: number }>({
         <SaveButton saving={saving} onSave={save} />
         <SavedToast show={saved} />
       </div>
+      <ErrorBanner message={saveError} />
     </Card>
   );
 }
